@@ -4,6 +4,49 @@ const jwt = require('jsonwebtoken');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'secret_para_desarrollo_123';
 
+// Verifica si el sistema ya tiene usuarios registrados
+exports.checkSetup = async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT COUNT(*) AS total FROM usuarios');
+    res.json({ needsSetup: rows[0].total === 0 });
+  } catch (error) {
+    console.error('Error en checkSetup:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+};
+
+// Registra el primer administrador (solo funciona si no hay ningún usuario)
+exports.registerAdmin = async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT COUNT(*) AS total FROM usuarios');
+    if (rows[0].total > 0) {
+      return res.status(403).json({ mensaje: 'El sistema ya está configurado. No se puede crear otro administrador inicial.' });
+    }
+
+    const { nombre, apellido, correo, celular, contraseña } = req.body;
+
+    if (!nombre || !correo || !contraseña) {
+      return res.status(400).json({ mensaje: 'Nombre, correo y contraseña son obligatorios.' });
+    }
+
+    const hash = await bcrypt.hash(contraseña, 10);
+
+    // Rol 1 = Administrador (ya existe en la DB por el SQL de producción)
+    await pool.query(
+      `INSERT INTO usuarios (nombre, apellido, correo, celular, contraseña, rol_id, estado) VALUES (?, ?, ?, ?, ?, 1, 1)`,
+      [nombre, apellido || null, correo, celular || null, hash]
+    );
+
+    res.status(201).json({ mensaje: 'Administrador creado exitosamente. Ya puedes iniciar sesión.' });
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ mensaje: 'Ese correo ya está registrado.' });
+    }
+    console.error('Error en registerAdmin:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+};
+
 exports.login = async (req, res) => {
   try {
     const { correo, contraseña } = req.body;
