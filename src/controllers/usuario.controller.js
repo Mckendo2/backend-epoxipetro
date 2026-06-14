@@ -41,6 +41,39 @@ exports.crearUsuario = async (req, res) => {
   }
 };
 
+exports.actualizarUsuario = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre, apellido, correo, celular, contraseña, rol_id, estado } = req.body;
+
+    if (!nombre || !correo || !rol_id) {
+      return res.status(400).json({ mensaje: 'Faltan campos obligatorios' });
+    }
+
+    if (contraseña && contraseña.trim() !== '') {
+      const saltRounds = 10;
+      const hash = await bcrypt.hash(contraseña, saltRounds);
+      await pool.query(
+        `UPDATE usuarios SET nombre=?, apellido=?, correo=?, celular=?, contraseña=?, rol_id=?, estado=? WHERE id=?`,
+        [nombre, apellido, correo, celular, hash, rol_id, estado ?? true, id]
+      );
+    } else {
+      await pool.query(
+        `UPDATE usuarios SET nombre=?, apellido=?, correo=?, celular=?, rol_id=?, estado=? WHERE id=?`,
+        [nombre, apellido, correo, celular, rol_id, estado ?? true, id]
+      );
+    }
+
+    res.json({ mensaje: 'Usuario actualizado exitosamente' });
+  } catch (error) {
+    console.error('Error al actualizar usuario:', error);
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ mensaje: 'El correo ya está registrado por otro usuario' });
+    }
+    res.status(500).json({ mensaje: 'Error interno del servidor al actualizar usuario' });
+  }
+};
+
 exports.cambiarEstado = async (req, res) => {
   try {
     const { id } = req.params;
