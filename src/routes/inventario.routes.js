@@ -18,6 +18,7 @@ const uploadImage = multer({ storage: storage });
 
 const ctrl = require('../controllers/inventario.controller');
 
+router.get('/alertas',                    ctrl.obtenerAlertasStock);
 router.get('/catalogos',                  ctrl.obtenerCatalogos);
 router.post('/categorias',                ctrl.crearCategoria);
 router.put('/categorias/:id',             ctrl.editarCategoria);
@@ -28,8 +29,12 @@ router.delete('/marcas/:id',              ctrl.eliminarMarca);
 router.get('/productos',                  ctrl.obtenerProductos);
 router.post('/productos',                 uploadImage.single('imagen'), ctrl.crearProducto);
 router.put('/productos/:id',              uploadImage.single('imagen'), ctrl.editarProducto);
+router.delete('/productos/:id',           ctrl.eliminarProducto);
 router.post('/presentaciones',            ctrl.crearPresentacion);
 router.put('/presentaciones/:id',         ctrl.editarPresentacion);
+router.delete('/presentaciones/:id',      ctrl.eliminarPresentacion);
+router.put('/presentaciones/:id/minimo',  ctrl.actualizarStockMinimo);
+router.get('/presentaciones/buscar',      ctrl.buscarPresentaciones);
 router.get('/scanner/:codigo',            ctrl.buscarPorCodigo);
 router.post('/movimientos/entrada-almacen', ctrl.entradaAlmacen);
 router.post('/movimientos/traslado-tienda', ctrl.trasladarATienda);

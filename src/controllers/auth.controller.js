@@ -133,3 +133,43 @@ exports.login = async (req, res) => {
     res.status(500).json({ mensaje: 'Error interno del servidor' });
   }
 };
+
+// GET /api/auth/me — refresca datos y permisos del usuario autenticado
+exports.getMe = async (req, res) => {
+  try {
+    // req.usuario es inyectado por el middleware de auth (JWT)
+    const usuario_id = req.usuario?.id;
+    if (!usuario_id) return res.status(401).json({ mensaje: 'No autenticado' });
+
+    const [rows] = await pool.query(
+      `SELECT u.id, u.nombre, u.apellido, u.correo, u.rol_id, r.nombre AS rol_nombre
+       FROM usuarios u
+       LEFT JOIN roles r ON u.rol_id = r.id
+       WHERE u.id = ? AND u.estado = 1`,
+      [usuario_id]
+    );
+    const usuario = rows[0];
+    if (!usuario) return res.status(404).json({ mensaje: 'Usuario no encontrado o desactivado' });
+
+    const [permisosRows] = await pool.query(
+      `SELECT p.codigo FROM permisos p
+       INNER JOIN rol_permisos rp ON p.id = rp.permiso_id
+       WHERE rp.rol_id = ?`,
+      [usuario.rol_id]
+    );
+    const permisos = permisosRows.map(r => r.codigo);
+
+    res.json({
+      id: usuario.id,
+      nombre: usuario.nombre,
+      apellido: usuario.apellido,
+      correo: usuario.correo,
+      rol_id: usuario.rol_id,
+      rol_nombre: usuario.rol_nombre,
+      permisos
+    });
+  } catch (error) {
+    console.error('Error en /me:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+};

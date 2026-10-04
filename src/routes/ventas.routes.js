@@ -8,7 +8,8 @@ router.get('/:id',         ctrl.obtenerVentaDetalle);
 router.post('/',           ctrl.registrarVenta);
 router.post('/:id/anular', ctrl.anularVenta);
 router.post('/:id/cobrar', ctrl.cobrarVenta);
-router.post('/:id/abono',  ctrl.registrarAbono);
+router.post('/:id/abono',       ctrl.registrarAbono);
+router.post('/:id/devolucion',  ctrl.registrarDevolucion);
 router.post('/desde-cotizacion/:id', ctrl.convertirCotizacion);
 
 module.exports = router;

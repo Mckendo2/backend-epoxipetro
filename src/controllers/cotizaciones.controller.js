@@ -95,3 +95,22 @@ exports.crearCotizacion = async (req, res) => {
     if (connection) connection.release();
   }
 };
+
+exports.anularCotizacion = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [result] = await pool.query(
+      `UPDATE cotizaciones SET estado = 'anulada' WHERE id = ? AND estado = 'pendiente'`,
+      [id]
+    );
+    
+    if (result.affectedRows === 0) {
+      return res.status(400).json({ mensaje: 'No se pudo anular la cotización. Puede que ya esté procesada o no exista.' });
+    }
+    
+    res.json({ mensaje: 'Cotización anulada exitosamente' });
+  } catch (error) {
+    console.error('Error al anular cotización:', error);
+    res.status(500).json({ mensaje: 'Error al anular la cotización' });
+  }
+};

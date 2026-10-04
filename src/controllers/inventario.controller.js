@@ -130,7 +130,7 @@ exports.obtenerProductos = async (req, res) => {
       LEFT JOIN unidades_medida u ON pr.unidad_medida_id = u.id
       LEFT JOIN inventario_tienda it ON it.presentacion_id = pr.id
       LEFT JOIN inventario_almacen ia ON ia.presentacion_id = pr.id
-      WHERE p.estado = true
+      WHERE p.estado = 1 AND (pr.estado = 1 OR pr.id IS NULL)
       ORDER BY p.nombre, pr.cantidad_unidad
     `);
 
@@ -224,6 +224,42 @@ exports.editarProducto = async (req, res) => {
   }
 };
 
+exports.eliminarProducto = async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { id } = req.params;
+    await conn.beginTransaction();
+
+    const [presentaciones] = await conn.query('SELECT id FROM presentaciones WHERE producto_id = ?', [id]);
+    for (const pr of presentaciones) {
+      const [[ventas]] = await conn.query('SELECT COUNT(*) as count FROM detalle_ventas WHERE presentacion_id = ?', [pr.id]);
+      if (ventas.count > 0) {
+        await conn.rollback();
+        return res.status(400).json({ mensaje: 'No se puede eliminar el producto porque tiene ventas asociadas.' });
+      }
+      await conn.query('DELETE FROM movimientos_stock WHERE presentacion_id = ?', [pr.id]);
+    }
+
+    const [resultado] = await conn.query('DELETE FROM productos WHERE id = ?', [id]);
+    if (resultado.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ mensaje: 'Producto no encontrado' });
+    }
+    
+    await conn.commit();
+    res.json({ mensaje: 'Producto eliminado permanentemente' });
+  } catch (error) {
+    await conn.rollback();
+    console.error(error);
+    if (error.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(400).json({ mensaje: 'No se puede eliminar el producto porque está en uso en otras tablas.' });
+    }
+    res.status(500).json({ mensaje: 'Error al eliminar el producto' });
+  } finally {
+    conn.release();
+  }
+};
+
 // --- Presentaciones ---
 exports.crearPresentacion = async (req, res) => {
   const conn = await pool.getConnection();
@@ -287,6 +323,70 @@ exports.editarPresentacion = async (req, res) => {
       return res.status(409).json({ mensaje: 'El código de barras o SKU ya está en uso por otra presentación' });
     }
     res.status(500).json({ mensaje: 'Error al actualizar la presentación' });
+  }
+};
+
+exports.eliminarPresentacion = async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const { id } = req.params;
+    await conn.beginTransaction();
+
+    const [[ventas]] = await conn.query('SELECT COUNT(*) as count FROM detalle_ventas WHERE presentacion_id = ?', [id]);
+    if (ventas.count > 0) {
+      await conn.rollback();
+      return res.status(400).json({ mensaje: 'No se puede eliminar porque tiene ventas asociadas.' });
+    }
+
+    await conn.query('DELETE FROM movimientos_stock WHERE presentacion_id = ?', [id]);
+    
+    const [resultado] = await conn.query('DELETE FROM presentaciones WHERE id = ?', [id]);
+    if (resultado.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ mensaje: 'Presentación no encontrada' });
+    }
+    
+    await conn.commit();
+    res.json({ mensaje: 'Presentación eliminada permanentemente' });
+  } catch (error) {
+    await conn.rollback();
+    console.error(error);
+    if (error.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(400).json({ mensaje: 'No se puede eliminar la presentación porque está en uso en el sistema.' });
+    }
+    res.status(500).json({ mensaje: 'Error al eliminar la presentación' });
+  } finally {
+    conn.release();
+  }
+};
+
+exports.actualizarStockMinimo = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { cantidad_minima } = req.body;
+    
+    if (cantidad_minima === undefined) {
+      return res.status(400).json({ mensaje: 'La cantidad mínima es obligatoria' });
+    }
+
+    const [resultado] = await pool.query(
+      `UPDATE inventario_tienda SET cantidad_minima = ? WHERE presentacion_id = ?`,
+      [cantidad_minima, id]
+    );
+
+    if (resultado.affectedRows === 0) {
+      // If the row doesn't exist, we could insert it, but usually it's created on first movement.
+      // We will insert it if it doesn't exist just in case.
+      await pool.query(
+        `INSERT INTO inventario_tienda (presentacion_id, cantidad, cantidad_minima) VALUES (?, 0, ?)`,
+        [id, cantidad_minima]
+      );
+    }
+
+    res.json({ mensaje: 'Stock mínimo actualizado exitosamente' });
+  } catch (error) {
+    console.error('Error al actualizar stock mínimo:', error);
+    res.status(500).json({ mensaje: 'Error al actualizar el stock mínimo' });
   }
 };
 
@@ -675,5 +775,58 @@ exports.importarExcel = async (req, res) => {
     res.status(500).json({ mensaje: 'Error procesando el archivo de Excel' });
   } finally {
     conn.release();
+  }
+};
+
+// --- Búsqueda rápida de presentaciones (para autocompletado en orden de compra) ---
+exports.buscarPresentaciones = async (req, res) => {
+  try {
+    const q = req.query.q ? `%${req.query.q}%` : '%';
+    const [filas] = await pool.query(`
+      SELECT
+        pr.id,
+        CONCAT(p.nombre, ' - ', pr.nombre) AS label,
+        p.nombre AS producto_nombre,
+        pr.nombre AS presentacion_nombre,
+        pr.codigo_barras,
+        pr.precio_compra,
+        pr.precio_venta,
+        p.id AS producto_id,
+        p.categoria_id,
+        c.nombre AS categoria_nombre_actual
+      FROM presentaciones pr
+      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN categorias c ON p.categoria_id = c.id
+      WHERE p.estado = 1
+        AND (p.nombre LIKE ? OR pr.nombre LIKE ? OR pr.codigo_barras LIKE ?)
+      ORDER BY p.nombre, pr.nombre
+      LIMIT 20
+    `, [q, q, q]);
+    res.json(filas);
+  } catch (error) {
+    console.error('Error en búsqueda de presentaciones:', error);
+    res.status(500).json({ mensaje: 'Error en la búsqueda' });
+  }
+};
+
+// --- Alertas de Stock ---
+exports.obtenerAlertasStock = async (req, res) => {
+  try {
+    const [filas] = await pool.query(`
+      SELECT 
+        p.nombre AS producto_nombre,
+        pr.nombre AS presentacion_nombre,
+        it.cantidad AS stock_actual,
+        it.cantidad_minima AS stock_minimo
+      FROM inventario_tienda it
+      JOIN presentaciones pr ON it.presentacion_id = pr.id AND pr.estado = 1
+      JOIN productos p ON pr.producto_id = p.id AND p.estado = 1
+      WHERE it.cantidad <= it.cantidad_minima AND it.cantidad_minima > 0
+      ORDER BY it.cantidad ASC
+    `);
+    res.json(filas);
+  } catch (error) {
+    console.error('Error al obtener alertas de stock:', error);
+    res.status(500).json({ mensaje: 'Error al obtener alertas de stock' });
   }
 };

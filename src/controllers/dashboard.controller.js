@@ -105,3 +105,64 @@ exports.obtenerEstadisticas = async (req, res) => {
     res.status(500).json({ mensaje: 'Error interno del servidor al obtener estadísticas' });
   }
 };
+
+// GET /api/dashboard/ganancia-productos — cruce de ventas × precio_compra
+exports.gananciaLiquidaProductos = async (req, res) => {
+  try {
+    const { fechaInicio, fechaFin } = req.query;
+
+    if (!fechaInicio || !fechaFin) {
+      return res.status(400).json({ mensaje: 'Las fechas de inicio y fin son obligatorias' });
+    }
+
+    const start = `${fechaInicio} 00:00:00`;
+    const end   = `${fechaFin} 23:59:59`;
+
+    const [filas] = await pool.query(`
+      SELECT
+        p.nombre                                              AS producto,
+        pr.nombre                                             AS presentacion,
+        SUM(dv.cantidad)                                      AS unidades_vendidas,
+        ROUND(SUM(dv.precio_unitario * dv.cantidad), 2)       AS ingresos,
+        ROUND(SUM(COALESCE(pr.precio_compra, 0) * dv.cantidad), 2) AS costo,
+        ROUND(
+          SUM(dv.precio_unitario * dv.cantidad)
+          - SUM(COALESCE(pr.precio_compra, 0) * dv.cantidad),
+          2
+        )                                                     AS ganancia,
+        ROUND(
+          CASE WHEN SUM(pr.precio_compra * dv.cantidad) > 0
+            THEN (
+              (SUM(dv.precio_unitario * dv.cantidad) - SUM(pr.precio_compra * dv.cantidad))
+              / SUM(pr.precio_compra * dv.cantidad) * 100
+            )
+            ELSE NULL
+          END,
+          1
+        )                                                     AS margen_pct
+      FROM detalle_ventas dv
+      JOIN ventas v          ON dv.venta_id        = v.id
+      JOIN presentaciones pr ON dv.presentacion_id = pr.id
+      JOIN productos p       ON pr.producto_id     = p.id
+      WHERE v.estado = 'completada'
+        AND v.created_at BETWEEN ? AND ?
+      GROUP BY pr.id
+      ORDER BY ganancia DESC
+      LIMIT 12
+    `, [start, end]);
+
+    res.json(filas.map(r => ({
+      nombre:   (r.presentacion === 'Unidad' || r.presentacion === 'General')
+                  ? r.producto
+                  : `${r.producto} — ${r.presentacion}`,
+      unidades: parseInt(r.unidades_vendidas || 0),
+      ingresos: parseFloat(r.ingresos        || 0),
+      costo:    parseFloat(r.costo           || 0),
+      ganancia: parseFloat(r.ganancia        || 0),
+      margen:   r.margen_pct !== null ? parseFloat(r.margen_pct) : null,
+    })));
+  } catch (error) {
+    console.error('Error en gananciaLiquidaProductos:', error);
+    res.status(500).json({ mensaje: 'Error interno al calcular ganancia líquida' });
+  }
+};
