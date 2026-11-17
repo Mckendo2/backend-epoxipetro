@@ -1,5 +1,12 @@
 const pool = require('../config/db');
 
+// Condición SQL exacta para notas de movimientos de una compra.
+// Evita que "Orden de compra #1%" coincida también con #10, #11, #100…
+const condNotaCompra = (prefijo, id) => ({
+  sql: '(ms.nota = ? OR ms.nota LIKE ?)',
+  params: [`${prefijo}${id}`, `${prefijo}${id} - %`]
+});
+
 // ─── GET /api/proveedores ────────────────────────────────────────────────────
 // Lista todos los proveedores con su deuda pendiente actual
 exports.obtenerProveedores = async (req, res) => {
@@ -113,14 +120,14 @@ exports.obtenerItemsCompra = async (req, res) => {
         ms.nota,
         p.id AS presentacion_id,
         p.precio_compra,
-        prod.nombre AS producto_nombre,
-        p.nombre AS presentacion_nombre,
+        COALESCE(prod.nombre, '(producto eliminado)') AS producto_nombre,
+        COALESCE(p.nombre, '(eliminado)')             AS presentacion_nombre,
         p.codigo_barras
       FROM movimientos_stock ms
-      JOIN presentaciones p ON ms.presentacion_id = p.id
-      JOIN productos prod ON p.producto_id = prod.id
-      WHERE ms.nota LIKE ?
-    `, [`Orden de compra #${id}%`]);
+      LEFT JOIN presentaciones p ON ms.presentacion_id = p.id
+      LEFT JOIN productos prod ON p.producto_id = prod.id
+      WHERE ${condNotaCompra('Orden de compra #', parseInt(id)).sql}
+    `, condNotaCompra('Orden de compra #', parseInt(id)).params);
 
     res.json(items);
   } catch (error) {
@@ -158,10 +165,11 @@ exports.registrarCompra = async (req, res) => {
     const estado_pago = tipo_pago === 'contado' ? 'pagado' : 'pendiente';
 
     // 2. Registrar la cabecera de la compra
+    // created_at explícito para que se registre en hora de Bolivia (igual que ventas)
     const [resCompra] = await conn.query(
       `INSERT INTO compras_proveedor
-        (proveedor_id, descripcion, monto, tipo_pago, estado_pago, fecha_vencimiento, nota)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        (proveedor_id, descripcion, monto, tipo_pago, estado_pago, fecha_vencimiento, nota, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         proveedor_id,
         numero_nota ? numero_nota : `Orden de compra — ${items.length} ítem(s)`,
@@ -169,7 +177,8 @@ exports.registrarCompra = async (req, res) => {
         tipo_pago,
         estado_pago,
         fecha_vencimiento || null,
-        nota || null
+        nota || null,
+        new Date()
       ]
     );
 
@@ -177,8 +186,8 @@ exports.registrarCompra = async (req, res) => {
 
     if (tipo_pago === 'contado' && montoTotal > 0) {
       await conn.query(
-        `INSERT INTO pagos_proveedor (compra_id, monto, metodo_pago, nota) VALUES (?, ?, 'efectivo', 'Pago automático (Compra al contado)')`,
-        [compra_id, montoTotal]
+        `INSERT INTO pagos_proveedor (compra_id, monto, metodo_pago, nota, created_at) VALUES (?, ?, 'efectivo', 'Pago automático (Compra al contado)', ?)`,
+        [compra_id, montoTotal, new Date()]
       );
     }
 
@@ -230,18 +239,32 @@ exports.registrarCompra = async (req, res) => {
           }
         }
 
-        // Verificar si ya existe presentación con ese código de barras
-        if (item.codigo_barras) {
+        // ── Buscar presentación existente para evitar duplicados ──────────────
+        // 1) Por código de barras (más específico)
+        if (!presentacion_id && item.codigo_barras) {
           const [existePres] = await conn.query(
             'SELECT id FROM presentaciones WHERE codigo_barras = ? LIMIT 1',
             [item.codigo_barras]
           );
-          if (existePres.length > 0) {
-            presentacion_id = existePres[0].id;
-          }
+          if (existePres.length > 0) presentacion_id = existePres[0].id;
+        }
+        // 2) Por nombre de presentación dentro del mismo producto
+        if (!presentacion_id && producto_id) {
+          const [existePres] = await conn.query(
+            'SELECT id FROM presentaciones WHERE producto_id = ? AND nombre = ? LIMIT 1',
+            [producto_id, nombrePres]
+          );
+          if (existePres.length > 0) presentacion_id = existePres[0].id;
         }
 
-        if (!presentacion_id) {
+        if (presentacion_id) {
+          // Presentación ya existe → solo actualizar precios
+          await conn.query(
+            'UPDATE presentaciones SET precio_compra = ?, precio_venta = ? WHERE id = ?',
+            [precioComp, precioVenta, presentacion_id]
+          );
+        } else {
+          // Presentación nueva → crearla junto con sus filas de inventario
           const [resPres] = await conn.query(
             `INSERT INTO presentaciones
                (producto_id, nombre, codigo_barras, precio_compra, precio_venta, cantidad_unidad)
@@ -250,7 +273,6 @@ exports.registrarCompra = async (req, res) => {
           );
           presentacion_id = resPres.insertId;
 
-          // Inicializar filas de inventario en 0
           await conn.query(
             'INSERT INTO inventario_tienda (presentacion_id, cantidad, cantidad_minima) VALUES (?, 0, ?)',
             [presentacion_id, item.cantidad_minima || 0]
@@ -338,9 +360,10 @@ exports.registrarPago = async (req, res) => {
       return res.status(400).json({ mensaje: 'Esta compra ya está completamente pagada' });
     }
 
+    // created_at explícito para que el pago quede en hora de Bolivia
     await conn.query(
-      `INSERT INTO pagos_proveedor (compra_id, monto, metodo_pago, nota) VALUES (?, ?, ?, ?)`,
-      [id, monto, metodo_pago, nota || null]
+      `INSERT INTO pagos_proveedor (compra_id, monto, metodo_pago, nota, created_at) VALUES (?, ?, ?, ?, ?)`,
+      [id, monto, metodo_pago, nota || null, new Date()]
     );
 
     const [[pagos]] = await conn.query(
@@ -600,10 +623,10 @@ exports.registrarDevolucionCompra = async (req, res) => {
     // Si el monto llega a 0 → la compra fue devuelta totalmente → eliminar de la BD
     if (nuevoMontoCompra === 0) {
       // Obtener todos los movimientos de esta compra para eliminarlos del historial de stock
-      const compraLabel = `Orden de compra #${id}`;
+      const cond = condNotaCompra('Orden de compra #', parseInt(id));
       await conn.query(
-        `DELETE FROM movimientos_stock WHERE nota LIKE ?`,
-        [`${compraLabel}%`]
+        `DELETE ms FROM movimientos_stock ms WHERE ${cond.sql}`,
+        cond.params
       );
       await conn.query(`DELETE FROM pagos_proveedor WHERE compra_id = ?`, [id]);
       await conn.query(`DELETE FROM compras_proveedor WHERE id = ?`, [id]);
@@ -631,6 +654,111 @@ exports.registrarDevolucionCompra = async (req, res) => {
     await conn.rollback();
     console.error('Error al registrar devolución:', error);
     res.status(500).json({ mensaje: 'Error interno al registrar devolución' });
+  } finally {
+    conn.release();
+  }
+};
+
+// ─── DELETE /api/proveedores/compras/:id ─────────────────────────────────────
+// Elimina una orden de compra registrada por error y revierte todo su efecto:
+//  - Quita del inventario el stock neto que ingresó (entradas − devoluciones)
+//  - Borra sus movimientos de stock (orden, recepciones adicionales, devoluciones)
+//  - Borra sus pagos y la cabecera de la compra
+exports.eliminarCompra = async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).json({ mensaje: 'ID de compra inválido' });
+
+    await conn.beginTransaction();
+
+    const [[compra]] = await conn.query('SELECT id FROM compras_proveedor WHERE id = ? FOR UPDATE', [id]);
+    if (!compra) {
+      await conn.rollback();
+      return res.status(404).json({ mensaje: 'Orden de compra no encontrada (quizás ya fue eliminada)' });
+    }
+
+    const cEntrada    = condNotaCompra('Orden de compra #', id);
+    const cRecepcion  = condNotaCompra('Recepción adicional — Orden de compra #', id);
+    const cDevolucion = condNotaCompra('Devolución de Compra #', id);
+
+    // Stock neto por presentación que esta compra dejó en el inventario
+    const [netos] = await conn.query(`
+      SELECT ms.presentacion_id,
+        SUM(CASE WHEN ${cDevolucion.sql} THEN -ms.cantidad ELSE ms.cantidad END) AS neto
+      FROM movimientos_stock ms
+      WHERE ${cEntrada.sql} OR ${cRecepcion.sql} OR ${cDevolucion.sql}
+      GROUP BY ms.presentacion_id
+    `, [...cDevolucion.params, ...cEntrada.params, ...cRecepcion.params, ...cDevolucion.params]);
+
+    // 1) Verificar que haya stock suficiente para revertir (bloqueando las filas)
+    const ajustes = [];
+    const faltantes = [];
+    for (const { presentacion_id, neto } of netos) {
+      const porRestar = parseFloat(neto) || 0;
+      if (porRestar <= 0) continue;
+
+      const [[prod]] = await conn.query(
+        `SELECT prod.nombre AS producto FROM presentaciones p
+         JOIN productos prod ON prod.id = p.producto_id WHERE p.id = ?`,
+        [presentacion_id]
+      );
+      const [[filaAlm]] = await conn.query(
+        'SELECT cantidad FROM inventario_almacen WHERE presentacion_id = ? FOR UPDATE', [presentacion_id]
+      );
+      const [[filaTie]] = await conn.query(
+        'SELECT cantidad FROM inventario_tienda WHERE presentacion_id = ? FOR UPDATE', [presentacion_id]
+      );
+      const almacen = Math.max(0, parseFloat(filaAlm?.cantidad) || 0);
+      const tienda  = Math.max(0, parseFloat(filaTie?.cantidad) || 0);
+
+      if (almacen + tienda < porRestar) {
+        faltantes.push(`${prod?.producto || 'Producto #' + presentacion_id} (hay ${almacen + tienda}, se necesitan ${porRestar})`);
+        continue;
+      }
+      // Primero se descuenta del almacén; si ya pasó a tienda, el resto sale de tienda
+      const aRestarAlmacen = Math.min(almacen, porRestar);
+      ajustes.push({ presentacion_id, aRestarAlmacen, aRestarTienda: porRestar - aRestarAlmacen });
+    }
+
+    if (faltantes.length) {
+      await conn.rollback();
+      return res.status(409).json({
+        mensaje: 'No se puede eliminar la compra porque parte de sus productos ya se vendió o no está en stock:\n• '
+          + faltantes.join('\n• ')
+          + '\n\nUsa "Devolución de Compra" por la cantidad que todavía tienes.'
+      });
+    }
+
+    // 2) Aplicar los descuentos de stock
+    for (const { presentacion_id, aRestarAlmacen, aRestarTienda } of ajustes) {
+      if (aRestarAlmacen > 0) {
+        await conn.query(
+          'UPDATE inventario_almacen SET cantidad = cantidad - ? WHERE presentacion_id = ?',
+          [aRestarAlmacen, presentacion_id]
+        );
+      }
+      if (aRestarTienda > 0) {
+        await conn.query(
+          'UPDATE inventario_tienda SET cantidad = cantidad - ? WHERE presentacion_id = ?',
+          [aRestarTienda, presentacion_id]
+        );
+      }
+    }
+
+    await conn.query(
+      `DELETE ms FROM movimientos_stock ms WHERE ${cEntrada.sql} OR ${cRecepcion.sql} OR ${cDevolucion.sql}`,
+      [...cEntrada.params, ...cRecepcion.params, ...cDevolucion.params]
+    );
+    await conn.query('DELETE FROM pagos_proveedor WHERE compra_id = ?', [id]);
+    await conn.query('DELETE FROM compras_proveedor WHERE id = ?', [id]);
+
+    await conn.commit();
+    res.json({ mensaje: 'Orden de compra eliminada y stock revertido correctamente' });
+  } catch (error) {
+    await conn.rollback();
+    console.error('Error al eliminar compra:', error);
+    res.status(500).json({ mensaje: 'Error interno al eliminar la compra' });
   } finally {
     conn.release();
   }

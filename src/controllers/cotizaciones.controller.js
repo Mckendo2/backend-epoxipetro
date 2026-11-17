@@ -37,11 +37,13 @@ exports.obtenerCotizacionDetalle = async (req, res) => {
     if (!cotizacion) return res.status(404).json({ mensaje: 'Cotización no encontrada' });
 
     const [detalle] = await pool.query(`
-      SELECT dc.*, pr.nombre AS presentacion, p.nombre AS producto,
+      SELECT dc.*, 
+             COALESCE(pr.nombre, '(producto eliminado)') AS presentacion,
+             COALESCE(p.nombre,  '(producto eliminado)') AS producto,
              um.abreviatura AS unidad
       FROM detalle_cotizaciones dc
-      JOIN presentaciones pr ON dc.presentacion_id = pr.id
-      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN presentaciones pr ON dc.presentacion_id = pr.id
+      LEFT JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN unidades_medida um ON pr.unidad_medida_id = um.id
       WHERE dc.cotizacion_id = ?
     `, [id]);

@@ -184,6 +184,24 @@ exports.crearProducto = async (req, res) => {
 
     if (!nombre) return res.status(400).json({ mensaje: 'El nombre del producto es obligatorio' });
 
+    // ── Validación de duplicado (activos Y archivados) ────────────────────────
+    const [activo] = await pool.query(
+      'SELECT id FROM productos WHERE nombre = ? AND estado = 1 LIMIT 1', [nombre.trim()]
+    );
+    if (activo.length > 0) {
+      return res.status(409).json({ mensaje: `Ya existe un producto activo con el nombre "${nombre.trim()}". Búscalo en el almacén.` });
+    }
+    const [archivado] = await pool.query(
+      'SELECT id FROM productos WHERE nombre = ? AND estado = 0 LIMIT 1', [nombre.trim()]
+    );
+    if (archivado.length > 0) {
+      return res.status(409).json({ 
+        mensaje: `Ya existe un producto archivado con el nombre "${nombre.trim()}". Restaura el producto existente en lugar de crear uno nuevo.`,
+        tipo: 'archivado',
+        id: archivado[0].id
+      });
+    }
+
     const [resultado] = await pool.query(
       `INSERT INTO productos (nombre, descripcion, categoria_id, marca_id, imagen_url) VALUES (?, ?, ?, ?, ?)`,
       [nombre, descripcion, categoria_id || null, marca_id || null, imagen_url]
@@ -230,30 +248,36 @@ exports.eliminarProducto = async (req, res) => {
     const { id } = req.params;
     await conn.beginTransaction();
 
+    // Obtener todas las presentaciones del producto
     const [presentaciones] = await conn.query('SELECT id FROM presentaciones WHERE producto_id = ?', [id]);
+
     for (const pr of presentaciones) {
-      const [[ventas]] = await conn.query('SELECT COUNT(*) as count FROM detalle_ventas WHERE presentacion_id = ?', [pr.id]);
-      if (ventas.count > 0) {
-        await conn.rollback();
-        return res.status(400).json({ mensaje: 'No se puede eliminar el producto porque tiene ventas asociadas.' });
-      }
+      // Guardar snapshot del nombre en detalle_ventas antes de que el FK se ponga en NULL
+      await conn.query(`
+        UPDATE detalle_ventas dv
+        JOIN presentaciones pres ON dv.presentacion_id = pres.id
+        JOIN productos prod ON pres.producto_id = prod.id
+        SET dv.nombre_producto = prod.nombre,
+            dv.nombre_presentacion = pres.nombre
+        WHERE dv.presentacion_id = ? AND (dv.nombre_producto IS NULL OR dv.nombre_producto = '')
+      `, [pr.id]);
+
+      // Eliminar movimientos de stock (historial interno, no afecta ventas)
       await conn.query('DELETE FROM movimientos_stock WHERE presentacion_id = ?', [pr.id]);
     }
 
+    // Eliminar el producto (presentaciones e inventario se borran por CASCADE)
     const [resultado] = await conn.query('DELETE FROM productos WHERE id = ?', [id]);
     if (resultado.affectedRows === 0) {
       await conn.rollback();
       return res.status(404).json({ mensaje: 'Producto no encontrado' });
     }
-    
+
     await conn.commit();
-    res.json({ mensaje: 'Producto eliminado permanentemente' });
+    res.json({ mensaje: 'Producto eliminado. Las ventas anteriores conservan su historial.' });
   } catch (error) {
     await conn.rollback();
     console.error(error);
-    if (error.code === 'ER_ROW_IS_REFERENCED_2') {
-      return res.status(400).json({ mensaje: 'No se puede eliminar el producto porque está en uso en otras tablas.' });
-    }
     res.status(500).json({ mensaje: 'Error al eliminar el producto' });
   } finally {
     conn.release();
@@ -332,28 +356,30 @@ exports.eliminarPresentacion = async (req, res) => {
     const { id } = req.params;
     await conn.beginTransaction();
 
-    const [[ventas]] = await conn.query('SELECT COUNT(*) as count FROM detalle_ventas WHERE presentacion_id = ?', [id]);
-    if (ventas.count > 0) {
-      await conn.rollback();
-      return res.status(400).json({ mensaje: 'No se puede eliminar porque tiene ventas asociadas.' });
-    }
+    // Guardar snapshot del nombre en detalle_ventas antes de que el FK se ponga en NULL
+    await conn.query(`
+      UPDATE detalle_ventas dv
+      JOIN presentaciones pres ON dv.presentacion_id = pres.id
+      JOIN productos prod ON pres.producto_id = prod.id
+      SET dv.nombre_producto = prod.nombre,
+          dv.nombre_presentacion = pres.nombre
+      WHERE dv.presentacion_id = ? AND (dv.nombre_producto IS NULL OR dv.nombre_producto = '')
+    `, [id]);
 
+    // Eliminar movimientos de stock del historial interno
     await conn.query('DELETE FROM movimientos_stock WHERE presentacion_id = ?', [id]);
-    
+
     const [resultado] = await conn.query('DELETE FROM presentaciones WHERE id = ?', [id]);
     if (resultado.affectedRows === 0) {
       await conn.rollback();
       return res.status(404).json({ mensaje: 'Presentación no encontrada' });
     }
-    
+
     await conn.commit();
-    res.json({ mensaje: 'Presentación eliminada permanentemente' });
+    res.json({ mensaje: 'Presentación eliminada. Las ventas anteriores conservan su historial.' });
   } catch (error) {
     await conn.rollback();
     console.error(error);
-    if (error.code === 'ER_ROW_IS_REFERENCED_2') {
-      return res.status(400).json({ mensaje: 'No se puede eliminar la presentación porque está en uso en el sistema.' });
-    }
     res.status(500).json({ mensaje: 'Error al eliminar la presentación' });
   } finally {
     conn.release();
@@ -401,7 +427,8 @@ exports.buscarPorCodigo = async (req, res) => {
       FROM presentaciones pr
       JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN inventario_tienda it ON it.presentacion_id = pr.id
-      WHERE pr.codigo_barras = ? OR pr.sku = ?
+      WHERE (pr.codigo_barras = ? OR pr.sku = ?)
+        AND pr.estado = 1 AND p.estado = 1
     `, [codigo, codigo]);
 
     if (!filas.length) return res.status(404).json({ mensaje: 'Producto no encontrado' });
@@ -489,12 +516,13 @@ exports.obtenerMovimientos = async (req, res) => {
     const [filas] = await pool.query(`
       SELECT ms.id, ms.cantidad, ms.nota, ms.created_at,
              tm.descripcion AS tipo, tm.codigo AS tipo_codigo,
-             pr.nombre AS presentacion, p.nombre AS producto,
+             COALESCE(pr.nombre, '(producto eliminado)') AS presentacion,
+             COALESCE(p.nombre,  '(producto eliminado)') AS producto,
              u.nombre AS usuario
       FROM movimientos_stock ms
       JOIN tipos_movimiento tm ON ms.tipo_movimiento_id = tm.id
-      JOIN presentaciones pr ON ms.presentacion_id = pr.id
-      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN presentaciones pr ON ms.presentacion_id = pr.id
+      LEFT JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN usuarios u ON ms.usuario_id = u.id
       ORDER BY ms.created_at DESC
       LIMIT ?
@@ -797,7 +825,7 @@ exports.buscarPresentaciones = async (req, res) => {
       FROM presentaciones pr
       JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN categorias c ON p.categoria_id = c.id
-      WHERE p.estado = 1
+      WHERE p.estado = 1 AND pr.estado = 1
         AND (p.nombre LIKE ? OR pr.nombre LIKE ? OR pr.codigo_barras LIKE ?)
       ORDER BY p.nombre, pr.nombre
       LIMIT 20
@@ -806,6 +834,68 @@ exports.buscarPresentaciones = async (req, res) => {
   } catch (error) {
     console.error('Error en búsqueda de presentaciones:', error);
     res.status(500).json({ mensaje: 'Error en la búsqueda' });
+  }
+};
+
+// --- Archivar / Restaurar Producto (soft-delete) ---
+exports.archivarProducto = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [resultado] = await pool.query(
+      'UPDATE productos SET estado = 0 WHERE id = ?', [id]
+    );
+    if (resultado.affectedRows === 0)
+      return res.status(404).json({ mensaje: 'Producto no encontrado' });
+    res.json({ mensaje: 'Producto archivado. Las ventas asociadas no fueron afectadas.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error al archivar el producto' });
+  }
+};
+
+exports.restaurarProducto = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [resultado] = await pool.query(
+      'UPDATE productos SET estado = 1 WHERE id = ?', [id]
+    );
+    if (resultado.affectedRows === 0)
+      return res.status(404).json({ mensaje: 'Producto no encontrado' });
+    res.json({ mensaje: 'Producto restaurado exitosamente.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error al restaurar el producto' });
+  }
+};
+
+// --- Archivar / Restaurar Presentación (soft-delete) ---
+exports.archivarPresentacion = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [resultado] = await pool.query(
+      'UPDATE presentaciones SET estado = 0 WHERE id = ?', [id]
+    );
+    if (resultado.affectedRows === 0)
+      return res.status(404).json({ mensaje: 'Presentación no encontrada' });
+    res.json({ mensaje: 'Presentación archivada. Las ventas asociadas no fueron afectadas.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error al archivar la presentación' });
+  }
+};
+
+exports.restaurarPresentacion = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [resultado] = await pool.query(
+      'UPDATE presentaciones SET estado = 1 WHERE id = ?', [id]
+    );
+    if (resultado.affectedRows === 0)
+      return res.status(404).json({ mensaje: 'Presentación no encontrada' });
+    res.json({ mensaje: 'Presentación restaurada exitosamente.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error al restaurar la presentación' });
   }
 };
 

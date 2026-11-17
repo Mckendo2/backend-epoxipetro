@@ -69,12 +69,14 @@ exports.obtenerVentaDetalle = async (req, res) => {
     if (!venta) return res.status(404).json({ mensaje: 'Venta no encontrada' });
 
     const [detalle] = await pool.query(`
-      SELECT dv.*, pr.nombre AS presentacion, p.nombre AS producto,
-             um.abreviatura AS unidad,
+      SELECT dv.*,
+             COALESCE(pr.nombre, dv.nombre_presentacion, '(producto eliminado)') AS presentacion,
+             COALESCE(p.nombre,  dv.nombre_producto,     '(producto eliminado)') AS producto,
+             COALESCE(um.abreviatura, '') AS unidad,
              (SELECT COALESCE(SUM(dd.cantidad), 0) FROM detalle_devoluciones dd WHERE dd.detalle_venta_id = dv.id) AS ya_devuelto
       FROM detalle_ventas dv
-      JOIN presentaciones pr ON dv.presentacion_id = pr.id
-      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN presentaciones pr ON dv.presentacion_id = pr.id
+      LEFT JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN unidades_medida um ON pr.unidad_medida_id = um.id
       WHERE dv.venta_id = ?
     `, [id]);
@@ -169,11 +171,19 @@ exports.registrarVenta = async (req, res) => {
       const { presentacion_id, cantidad, precio_unitario } = item;
       const subtotal = parseFloat(precio_unitario) * parseFloat(cantidad);
 
-      // Insertar línea de detalle
+      // Leer nombres para snapshot (historial permanente aunque se borre el producto)
+      const [[snap]] = await conn.query(
+        `SELECT pr.nombre AS nombre_presentacion, p.nombre AS nombre_producto
+         FROM presentaciones pr JOIN productos p ON pr.producto_id = p.id
+         WHERE pr.id = ?`, [presentacion_id]
+      );
+
+      // Insertar línea de detalle con snapshot de nombre
       await conn.query(
-        `INSERT INTO detalle_ventas (venta_id, presentacion_id, cantidad, precio_unitario, subtotal)
-         VALUES (?, ?, ?, ?, ?)`,
-        [venta_id, presentacion_id, cantidad, precio_unitario, subtotal]
+        `INSERT INTO detalle_ventas (venta_id, presentacion_id, cantidad, precio_unitario, subtotal, nombre_producto, nombre_presentacion)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [venta_id, presentacion_id, cantidad, precio_unitario, subtotal,
+         snap?.nombre_producto || null, snap?.nombre_presentacion || null]
       );
 
       // Leer stock ANTES de descontar (para el audit log correcto)
@@ -225,8 +235,9 @@ exports.anularVenta = async (req, res) => {
 
     const [detalle] = await conn.query(`SELECT * FROM detalle_ventas WHERE venta_id = ?`, [id]);
 
-    // Revertir stock
+    // Revertir stock (solo si la presentación todavía existe)
     for (const item of detalle) {
+      if (!item.presentacion_id) continue; // producto eliminado — solo el snapshot queda
       await conn.query(
         `UPDATE inventario_tienda SET cantidad = cantidad + ? WHERE presentacion_id = ?`,
         [item.cantidad, item.presentacion_id]
@@ -375,10 +386,11 @@ exports.convertirCotizacion = async (req, res) => {
     }
 
     // 3. Crear la venta (después de verificar todo el stock)
+    // created_at explícito (igual que registrarVenta) para que se guarde en hora de Bolivia
     const [resultVenta] = await conn.query(
-      `INSERT INTO ventas (cliente_id, usuario_id, total, descuento, metodo_pago, nota, tipo_venta, estado_pago)
-       VALUES (?, ?, ?, 0, ?, ?, 'contado', 'pagado')`,
-      [cotizacion.cliente_id, usuario_id, cotizacion.total, metodo_pago, `Venta generada desde la cotización #${id}`]
+      `INSERT INTO ventas (cliente_id, usuario_id, total, descuento, metodo_pago, nota, tipo_venta, estado_pago, created_at)
+       VALUES (?, ?, ?, 0, ?, ?, 'contado', 'pagado', ?)`,
+      [cotizacion.cliente_id, usuario_id, cotizacion.total, metodo_pago, `Venta generada desde la cotización #${id}`, new Date()]
     );
     const venta_id = resultVenta.insertId;
 
@@ -388,11 +400,19 @@ exports.convertirCotizacion = async (req, res) => {
     for (const item of detalles) {
       const { presentacion_id, cantidad, precio_unitario, subtotal } = item;
 
-      // Insertar detalle de venta
+      // Leer nombres para snapshot
+      const [[snap]] = await conn.query(
+        `SELECT pr.nombre AS nombre_presentacion, p.nombre AS nombre_producto
+         FROM presentaciones pr JOIN productos p ON pr.producto_id = p.id
+         WHERE pr.id = ?`, [presentacion_id]
+      );
+
+      // Insertar detalle de venta con snapshot
       await conn.query(
-        `INSERT INTO detalle_ventas (venta_id, presentacion_id, cantidad, precio_unitario, subtotal)
-         VALUES (?, ?, ?, ?, ?)`,
-        [venta_id, presentacion_id, cantidad, precio_unitario, subtotal]
+        `INSERT INTO detalle_ventas (venta_id, presentacion_id, cantidad, precio_unitario, subtotal, nombre_producto, nombre_presentacion)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [venta_id, presentacion_id, cantidad, precio_unitario, subtotal,
+         snap?.nombre_producto || null, snap?.nombre_presentacion || null]
       );
 
       // Leer stock ANTES de descontar (para el audit log correcto)
@@ -478,9 +498,9 @@ exports.registrarDevolucion = async (req, res) => {
     for (const item of items) {
       const { detalle_venta_id, presentacion_id, cantidad } = item;
 
-      if (!detalle_venta_id || !presentacion_id || !cantidad || cantidad <= 0) {
+      if (!detalle_venta_id || !cantidad || cantidad <= 0) {
         await conn.rollback();
-        return res.status(400).json({ mensaje: 'Cada ítem debe tener detalle_venta_id, presentacion_id y cantidad válida' });
+        return res.status(400).json({ mensaje: 'Cada ítem debe tener detalle_venta_id y cantidad válida' });
       }
 
       // Validar que la cantidad a devolver no supere la cantidad original del ítem
@@ -511,8 +531,11 @@ exports.registrarDevolucion = async (req, res) => {
       await conn.query(
         `INSERT INTO detalle_devoluciones (devolucion_id, detalle_venta_id, presentacion_id, cantidad, precio_unitario)
          VALUES (?, ?, ?, ?, ?)`,
-        [devolucion_id, detalle_venta_id, presentacion_id, cantidad, detalleOriginal.precio_unitario]
+        [devolucion_id, detalle_venta_id, presentacion_id || null, cantidad, detalleOriginal.precio_unitario]
       );
+
+      // Si el producto fue eliminado, solo registrar la devolución — no hay stock que reponer
+      if (!presentacion_id) continue;
 
       // Obtener stock actual antes de reintegrar
       const [[it]] = await conn.query(

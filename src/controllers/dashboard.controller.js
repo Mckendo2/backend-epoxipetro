@@ -54,8 +54,8 @@ exports.obtenerEstadisticas = async (req, res) => {
         SUM(dv.cantidad) as cantidad
       FROM detalle_ventas dv
       JOIN ventas v ON dv.venta_id = v.id
-      JOIN presentaciones pr ON dv.presentacion_id = pr.id
-      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN presentaciones pr ON dv.presentacion_id = pr.id
+      LEFT JOIN productos p ON pr.producto_id = p.id
       LEFT JOIN categorias c ON p.categoria_id = c.id
       WHERE v.estado = 'completada' AND v.created_at BETWEEN ? AND ?
       GROUP BY c.nombre
@@ -66,15 +66,15 @@ exports.obtenerEstadisticas = async (req, res) => {
     // 4. Top 10 Productos Más Vendidos
     const [topProductos] = await pool.query(`
       SELECT 
-        p.nombre AS producto,
-        pr.nombre AS presentacion,
+        COALESCE(p.nombre, dv.nombre_producto, '(eliminado)') AS producto,
+        COALESCE(pr.nombre, dv.nombre_presentacion, '(eliminado)') AS presentacion,
         SUM(dv.cantidad) as cantidad
       FROM detalle_ventas dv
       JOIN ventas v ON dv.venta_id = v.id
-      JOIN presentaciones pr ON dv.presentacion_id = pr.id
-      JOIN productos p ON pr.producto_id = p.id
+      LEFT JOIN presentaciones pr ON dv.presentacion_id = pr.id
+      LEFT JOIN productos p ON pr.producto_id = p.id
       WHERE v.estado = 'completada' AND v.created_at BETWEEN ? AND ?
-      GROUP BY pr.id
+      GROUP BY dv.presentacion_id, dv.nombre_presentacion
       ORDER BY cantidad DESC
       LIMIT 10
     `, [start, end]);
@@ -120,33 +120,33 @@ exports.gananciaLiquidaProductos = async (req, res) => {
 
     const [filas] = await pool.query(`
       SELECT
-        p.nombre                                              AS producto,
-        pr.nombre                                             AS presentacion,
-        SUM(dv.cantidad)                                      AS unidades_vendidas,
-        ROUND(SUM(dv.precio_unitario * dv.cantidad), 2)       AS ingresos,
-        ROUND(SUM(COALESCE(pr.precio_compra, 0) * dv.cantidad), 2) AS costo,
+        COALESCE(p.nombre, dv.nombre_producto, '(eliminado)')               AS producto,
+        COALESCE(pr.nombre, dv.nombre_presentacion, '(eliminado)')          AS presentacion,
+        SUM(dv.cantidad)                                                     AS unidades_vendidas,
+        ROUND(SUM(dv.precio_unitario * dv.cantidad), 2)                     AS ingresos,
+        ROUND(SUM(COALESCE(pr.precio_compra, 0) * dv.cantidad), 2)          AS costo,
         ROUND(
           SUM(dv.precio_unitario * dv.cantidad)
           - SUM(COALESCE(pr.precio_compra, 0) * dv.cantidad),
           2
-        )                                                     AS ganancia,
+        )                                                                    AS ganancia,
         ROUND(
-          CASE WHEN SUM(pr.precio_compra * dv.cantidad) > 0
+          CASE WHEN SUM(COALESCE(pr.precio_compra,0) * dv.cantidad) > 0
             THEN (
-              (SUM(dv.precio_unitario * dv.cantidad) - SUM(pr.precio_compra * dv.cantidad))
-              / SUM(pr.precio_compra * dv.cantidad) * 100
+              (SUM(dv.precio_unitario * dv.cantidad) - SUM(COALESCE(pr.precio_compra,0) * dv.cantidad))
+              / SUM(COALESCE(pr.precio_compra,0) * dv.cantidad) * 100
             )
             ELSE NULL
           END,
           1
-        )                                                     AS margen_pct
+        )                                                                    AS margen_pct
       FROM detalle_ventas dv
-      JOIN ventas v          ON dv.venta_id        = v.id
-      JOIN presentaciones pr ON dv.presentacion_id = pr.id
-      JOIN productos p       ON pr.producto_id     = p.id
+      JOIN ventas v               ON dv.venta_id        = v.id
+      LEFT JOIN presentaciones pr ON dv.presentacion_id = pr.id
+      LEFT JOIN productos p       ON pr.producto_id     = p.id
       WHERE v.estado = 'completada'
         AND v.created_at BETWEEN ? AND ?
-      GROUP BY pr.id
+      GROUP BY dv.presentacion_id, dv.nombre_presentacion
       ORDER BY ganancia DESC
       LIMIT 12
     `, [start, end]);

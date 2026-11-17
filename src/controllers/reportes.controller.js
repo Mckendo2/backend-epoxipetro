@@ -104,11 +104,12 @@ exports.inventarioValorizado = async (req, res) => {
         ((IFNULL(ia.cantidad, 0) + IFNULL(it.cantidad, 0)) * pr.precio_compra) AS valor_invertido,
         ((IFNULL(ia.cantidad, 0) + IFNULL(it.cantidad, 0)) * pr.precio_venta) AS valor_venta_proyectado
       FROM productos p
-      JOIN presentaciones pr ON p.id = pr.producto_id
+      JOIN presentaciones pr ON p.id = pr.producto_id AND pr.estado = 1
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN inventario_almacen ia ON pr.id = ia.presentacion_id
       LEFT JOIN inventario_tienda it ON pr.id = it.presentacion_id
-      WHERE (IFNULL(ia.cantidad, 0) + IFNULL(it.cantidad, 0)) > 0
+      WHERE p.estado = 1
+        AND (IFNULL(ia.cantidad, 0) + IFNULL(it.cantidad, 0)) > 0
       ORDER BY valor_invertido DESC
     `);
 

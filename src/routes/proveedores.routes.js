@@ -37,6 +37,7 @@ router.post('/compras', (req, res, next) => {
 router.post('/compras/:id/pagar',    ctrl.registrarPago);
 router.post('/compras/:id/recepcion', ctrl.registrarRecepcion);
 router.post('/compras/:id/devolucion', ctrl.registrarDevolucionCompra);
+router.delete('/compras/:id',        ctrl.eliminarCompra);
 router.get('/',                      ctrl.obtenerProveedores);
 router.post('/',                     ctrl.crearProveedor);
 router.put('/:id',                   ctrl.editarProveedor);

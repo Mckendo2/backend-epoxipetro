@@ -11,14 +11,17 @@ exports.obtenerCatalogoPublico = async (req, res) => {
         pr.codigo_barras, pr.sku,
         pr.precio_venta,
         u.abreviatura AS unidad,
-        COALESCE(it.cantidad, 0) AS stock_tienda
+        COALESCE(it.cantidad, 0) AS stock_tienda,
+        COALESCE(ia.cantidad, 0) AS stock_almacen,
+        (COALESCE(it.cantidad, 0) + COALESCE(ia.cantidad, 0)) AS stock_total
       FROM productos p
       LEFT JOIN categorias c ON p.categoria_id = c.id
       LEFT JOIN marcas m ON p.marca_id = m.id
       JOIN presentaciones pr ON pr.producto_id = p.id
       LEFT JOIN unidades_medida u ON pr.unidad_medida_id = u.id
       LEFT JOIN inventario_tienda it ON it.presentacion_id = pr.id
-      WHERE p.estado = true
+      LEFT JOIN inventario_almacen ia ON ia.presentacion_id = pr.id
+      WHERE p.estado = true AND pr.estado = 1
       ORDER BY p.nombre, pr.cantidad_unidad
     `);
 
@@ -30,8 +33,8 @@ exports.obtenerCatalogoPublico = async (req, res) => {
           id: f.id, 
           nombre: f.nombre, 
           descripcion: f.descripcion,
-          categoria: f.categoria, 
-          marca: f.marca, 
+          categoria: f.categoria || 'General', 
+          marca: f.marca || 'Sin marca', 
           imagen_url: f.imagen_url,
           presentaciones: []
         };
@@ -41,9 +44,11 @@ exports.obtenerCatalogoPublico = async (req, res) => {
         nombre: f.presentacion_nombre,
         codigo_barras: f.codigo_barras,
         sku: f.sku,
-        precio_venta: f.precio_venta,
+        precio_venta: Number(f.precio_venta || 0),
         unidad: f.unidad,
-        stock_tienda: f.stock_tienda
+        stock_tienda: Number(f.stock_tienda || 0),
+        stock_almacen: Number(f.stock_almacen || 0),
+        stock_total: Number(f.stock_total || 0)
       });
     });
 
